@@ -1,0 +1,312 @@
+---
+title: Analysis of scRNA-seq data from retinal cone cells
+author: Michael Epstein, Aaron Lun
+date: 7 May 2017
+output: 
+  html_document:
+    fig_caption: false
+    toc: true
+    toc_float: true
+    depth: 3
+    number_sections: true
+    theme: united 
+    highlight: tango 
+---
+
+```{r, results="hide", echo=FALSE}
+knitr::opts_chunk$set(error=FALSE, warning=FALSE, message=FALSE)
+options(width=100, bitmapType="cairo")
+```
+
+# Setting up data structures 
+
+Loading counts into memory and creating `SCESet` objects:
+
+```{r}
+counts <- read.table("gtp_counts.txt", header=TRUE, row.names=1, sep="\t",
+                     colClasses=c(list("character", NULL, NULL, NULL, NULL, NULL), rep(list("integer"), 73)))
+counts <- counts[,-1]
+colnames(counts) <- sub(".*\\.([0-9]+)_out\\.bam$", "\\1", colnames(counts))
+library(scran)
+sce <- newSCESet(countData=counts)
+sce
+```
+
+Adding annotation.
+
+```{r}
+library(biomaRt)
+ensembl <- useMart(biomart='ENSEMBL_MART_ENSEMBL', dataset="hsapiens_gene_ensembl", 
+    host="sep2015.archive.ensembl.org") # Ensembl version 75.
+anno <- getBM(attributes=c('ensembl_gene_id',  'chromosome_name', 'gene_biotype', 
+    'external_gene_name', 'entrezgene'), filters="ensembl_gene_id",
+    values=rownames(sce), mart=ensembl)
+anno <- anno[match(rownames(sce), anno$ensembl_gene_id),]
+fData(sce) <- cbind(fData(sce), anno, original=rownames(sce))
+```
+
+Replacing row names for convenience.
+
+```{r}
+newnames <- anno$external_gene_name
+islost <- is.na(newnames)
+newnames[islost] <- rownames(sce)[islost]
+ncounts <- table(newnames)
+isdup <- newnames %in% names(ncounts)[ncounts > 1]
+newnames[isdup] <- paste0(newnames[isdup], "_", rownames(sce)[isdup])
+rownames(sce) <- newnames
+```
+
+# Quality control on the cells
+
+Computing quality control metrics and specifying the spike-in transcripts.
+
+```{r}
+sce <- calculateQCMetrics(sce, feature_controls=list(ERCC=grepl("^ERCC", fData(sce)$original), 
+                          Mito=which(fData(sce)$chromosome_name=="MT")))
+setSpike(sce) <- "ERCC"
+```
+
+Plotting all of the QC metrics.
+
+```{r}
+par(mfrow=c(2,2))
+hist(log10(sce$total_counts), xlab="Log10 total counts", main="", col="grey")
+hist(log10(sce$total_features), xlab="Log10 total features", main="", col="grey")
+hist(sce$pct_exprs_feature_controls_ERCC, xlab="Spike-in %", main="", col="grey")
+hist(sce$pct_exprs_feature_controls_Mito, xlab="Mitochondrial %", main="", col="grey")
+```
+
+Identifying outliers and removing them.
+
+```{r}
+lowlib <- isOutlier(sce$total_counts, log=TRUE, nmad=3, type="lower")
+lowfeat <- isOutlier(sce$total_features, log=TRUE, nmad=3, type="lower")
+highspike <- isOutlier(sce$pct_exprs_feature_controls_ERCC, nmad=3, type="higher")
+highmito <- isOutlier(sce$pct_exprs_feature_controls_Mito, nmad=3, type="higher")
+discard <- lowlib| lowfeat|highspike|highmito
+sce <- sce[,!discard]
+data.frame(LowLib=sum(lowlib), LowFeat=sum(lowfeat), HighSpike=sum(highspike), 
+           HighMito=sum(highmito), Total=sum(discard))
+```
+
+# Cell cycle phase assignment
+
+Assigning cells to phases of the cell cycle.
+
+```{r}
+hs.pairs <- readRDS(system.file("exdata", "human_cycle_markers.rds", package="scran"))
+assignments <- cyclone(sce, hs.pairs, gene.names=fData(sce)$ensembl_gene_id)
+sce$phase <- assignments$phases
+table(sce$phase)
+```
+
+Plotting scores.
+
+```{r}
+plot(assignments$scores$G1, assignments$scores$G2M)
+```
+
+Probably doesn't make much sense for postmitotic neurons.
+
+# Filtering out low-abundance or uninteresting genes
+
+Examining the most highly expressed genes.
+
+```{r}
+plotHighestExprs(sce)
+```
+
+Computing the average count. 
+
+```{r}
+ave <- calcAverage(sce)
+hist(log2(ave), xlab="Log2 average count", col="grey")
+abline(v=0, col="red", lwd=2, lty=2)
+```
+
+Filtering to remove low-abundance genes.
+
+```{r}
+keep <- ave > 1 
+sce <- sce[keep,]
+summary(keep)
+```
+
+# Normalizing for cell-specific biases
+
+Computing size factors for endogenous genes.
+
+```{r}
+sce <- computeSumFactors(sce, sizes=seq(20, 60, 5))
+summary(sizeFactors(sce))
+plot(sce$total_counts, sizeFactors(sce), log="xy")
+```
+
+Computing size factors for spike-in transcripts.
+
+```{r}
+sce <- computeSpikeFactors(sce, general.use=FALSE)
+summary(sizeFactors(sce, "ERCC"))
+plot(sizeFactors(sce, "ERCC"), sizeFactors(sce), log="xy")
+```
+
+Applying the size factors to compute normalized log-expression values.
+
+```{r}
+sce <- normalize(sce)
+```
+
+# Identifying highly variable genes
+
+Modelling the technical trend in the log-variances using the spike-in transcripts (red).
+
+```{r}
+fit <- trendVar(sce)
+var.out <- decomposeVar(sce, fit)
+plot(var.out$mean, var.out$total, xlab="Log-mean", ylab="Variance", pch=16)
+points(fit$mean, fit$var, col="red", pch=16)
+curve(fit$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+```
+
+Identifying highly variable genes.
+
+```{r}
+var.out <- var.out[order(-var.out$bio),]
+write.table(file="hvg.tsv", var.out, col.names=NA, quote=FALSE, sep="\t")
+head(var.out, 20)
+chosen <- rownames(var.out)[which(var.out$bio > 0.5 & var.out$FDR <= 0.05)]
+length(chosen)
+```
+
+Incidentally, there aren't that many genes with significant correlations.
+Probably due to the low number of cells and the weakness of the substructure.
+So, we'll proceed using only the HVGs.
+
+```{r}
+set.seed(100)
+var.cor <- correlatePairs(sce, subset.row=chosen, iters=1e7)
+sum(var.cor$FDR <= 0.05)
+```
+
+# Dimensionality reduction with PCA
+
+Using the HVGs to perform dimensionality reduction.
+
+```{r}
+pc <- prcomp(t(exprs(sce)[chosen,]), scale=TRUE)
+pc1 <- pc$x[,1]
+explained <- pc$sdev[1:2]^2/sum(pc$sdev^2) * 100 # variance explained by first two pcs
+explained
+```
+
+Plotting the first two PCs.
+
+```{r, results="hide"}
+library(viridis)
+ref.cols <- viridis(100)[cut(pc1, breaks=100)]
+pdf("pca.pdf")
+plot(pc$x[,1], pc$x[,2], col=ref.cols, pch=16, cex=1.5,
+    xlab=sprintf("PC1 (%.1f%%)", explained[1]), 
+    ylab=sprintf("PC2 (%.1f%%)", explained[2]),
+    cex.lab=1.4, cex.axis=1.2)
+dev.off()
+```
+
+<object data="pca.pdf" type="application/pdf" width="700px" height="700px" />
+
+# Finding DE genes against PC1
+
+Using _limma_ to identify DE genes with respect to the first PC:
+
+```{r}
+library(limma)
+design <- model.matrix(~pc1)
+fit <- lmFit(exprs(sce)[!isSpike(sce),], design)
+fit <- eBayes(fit)
+summary(decideTests(fit))
+res <- topTable(fit, n=Inf)
+write.table(res, file="de_pc1.tsv", col.names=NA, sep="\t", quote=FALSE)
+head(res)
+```
+
+Making a heatmap of the DE genes.
+
+```{r, results="hide"}
+sig.genes <- rownames(res)[res$adj <= 0.05]
+o <- order(pc1)
+library(gplots)
+pdf("heat.pdf", width=6, height=20)
+heat.vals <- exprs(sce)[sig.genes,o]
+heat.vals <- heat.vals - rowMeans(heat.vals)
+heatmap.2(heat.vals, Colv=FALSE, col=bluered, trace="none", dendrogram="none",
+          ColSideColors=ref.cols[o])
+dev.off()
+```
+
+<object data="heat.pdf" type="application/pdf" width="700px" height="700px" />
+
+We also have a look at the genes that intersect.
+
+```{r}
+in.bulk <- read.table("cone_sig_bulk.txt", stringsAsFactors=FALSE)
+nrow(in.bulk)
+in.both <- sig.genes[sig.genes %in% in.bulk[,1]]
+length(in.both)
+both.genes <- res[in.both,]
+write.table(both.genes, file="de_shared.tsv", col.names=NA, sep="\t", quote=FALSE)
+head(both.genes)
+```
+
+# Visualizing some specific genes
+
+Looking at some genes that change from left to right. 
+
+```{r}
+pdf("exprs.pdf")
+par(mar=c(5.1, 5.1, 4.1, 2.1))
+of.interest <- c("OPN1MW2", "OPN1LW", "ARR3", "CRABP2", "ENO2",
+    "GNAT2", "GNB3", 
+    # "ONECUT1", # ENSG00000169856, not expressed
+    "PDE6C", "PDE6H", "TULP1", "SALL3", "THRB", "RXRG", "CRX", 
+    "RCVRN", "OTX2", "RAX", "OPN1SW", 
+    "ENSG00000147380", # OPN1MW
+    "NRL", 
+    "ENSG00000031544", # NR2E3
+    "SOX11", "TMSB4X", "SOX4", "GPM6A", 
+    "DPYSL3", # CRMP4
+    "SPON2", "THOC6", "CNGB3", "GUCA1A")
+for (x in of.interest) { 
+    plot(pc1, exprs(sce)[x,], main=x, cex.axis=1.2, cex.lab=1.4, col=ref.cols, 
+         pch=16, cex=1.5, xlab="PC1", ylab=expression(Log[2]~"[normalized count]"))
+}
+dev.off()
+```
+
+<object data="exprs.pdf" type="application/pdf" width="700px" height="700px" />
+
+<!--
+pdf("marker_cor.pdf")
+plot(exprs(sce)["THRB",], exprs(sce)["OPN1LW",])
+plot(exprs(sce)["THRB",], exprs(sce)["OPN1MW2",])
+plot(exprs(sce)["THRB",], exprs(sce)["ARR3",])
+plot(exprs(sce)["RXRG",], exprs(sce)["OPN1LW",])
+plot(exprs(sce)["RXRG",], exprs(sce)["OPN1MW2",])
+plot(exprs(sce)["RXRG",], exprs(sce)["ARR3",])
+plot(exprs(sce)["OPN1LW",], exprs(sce)["ARR3",])
+dev.off()
+-->
+
+# Wrapping up
+
+Saving the relevant objects.
+
+```{r}
+save(pc, sce, file="objects.Rdata")
+```
+
+Reporting the session information.
+
+```{r}
+sessionInfo()
+```
